@@ -15,14 +15,22 @@
 #include <math.h>
 #include <time.h>
 
+typedef struct {
+    float x, y;
+} SparkPosition;
+
 // Structure for managing game state
 typedef struct {
     AMCOM_ObjectState objects[AMCOM_MAX_OBJECT_UPDATES];
     uint8_t objectCount;
+    float currentTargetAngle;
+    float currentTargetScore;
     uint32_t currentGameTime;
     uint8_t myPlayerNumber;
     float mapWidth, mapHeight;
     bool gameActive;
+    SparkPosition storedSparks[8];
+    uint8_t sparkCount;
 } GameState;
 
 // Global game state variable
@@ -40,6 +48,77 @@ void removeDeadObjects(){
             i--; // Adjust index after removal
         }
     }
+}
+
+void storeNearestSparks() {
+    gameState.sparkCount = 0;
+    for(int i = 0; i < gameState.objectCount && gameState.sparkCount < 5; i++) {
+        if(gameState.objects[i].objectType == 2) { // Spark
+            gameState.storedSparks[gameState.sparkCount].x = gameState.objects[i].x;
+            gameState.storedSparks[gameState.sparkCount].y = gameState.objects[i].y;
+            gameState.sparkCount++;
+            printf("Stored spark at (%.1f, %.1f)\n", 
+                   gameState.objects[i].x, gameState.objects[i].y);
+        }
+    }
+    printf("Total sparks stored: %d\n", gameState.sparkCount);
+}
+
+float calculateThreatScore(float targetX, float targetY) {
+    float threat = 0.0f;
+    for(int i = 0; i < gameState.objectCount; i++) {
+        if(gameState.objects[i].objectType == 0 && 
+           gameState.objects[i].objectNo != gameState.myPlayerNumber &&
+           gameState.objects[i].hp > 0) {
+            
+            float dx = targetX - gameState.objects[i].x;
+            float dy = targetY - gameState.objects[i].y;
+            float distToThreat = sqrtf(dx*dx + dy*dy);
+            
+            if(distToThreat < 100.0f) {
+                threat += (gameState.objects[i].hp / 10.0f) * (1.0f - (distToThreat / 100.0f));
+                printf("Threat from player %d at distance %.1f: +%.2f\n", 
+                       gameState.objects[i].objectNo, distToThreat, threat);
+            }
+        }
+    }
+    return threat;
+}
+
+float avoidSparkTrajectory(float targetX, float targetY, float myX, float myY) {
+    float baseAngle = atan2f(targetY - myY, targetX - myX);
+    
+    for(int i = 0; i < gameState.sparkCount; i++) {
+        float sparkX = gameState.storedSparks[i].x;
+        float sparkY = gameState.storedSparks[i].y;
+        
+        float dx = sparkX - myX;
+        float dy = sparkY - myY;
+        float distToSpark = sqrtf(dx*dx + dy*dy);
+        
+        if(distToSpark < 100.0f) {
+            float sparkAngle = atan2f(dy, dx);
+            float angleDiff = fabsf(sparkAngle - baseAngle);
+            
+            if(angleDiff < M_PI/3) { // 60 stopni tolerancji
+                printf("AVOIDING SPARK at (%.1f, %.1f), distance=%.1f!\n", 
+                       sparkX, sparkY, distToSpark);
+                
+                // Omijaj iskrę
+                if(sparkAngle > baseAngle) {
+                    baseAngle -= M_PI/2; // 90 stopni w lewo
+                } else {
+                    baseAngle += M_PI/2; // 90 stopni w prawo
+                }
+                
+                printf("Adjusted angle to: %.2f rad (%.1f degrees)\n", 
+                       baseAngle, baseAngle * 180.0f / M_PI);
+                break;
+            }
+        }
+    }
+    
+    return baseAngle;
 }
 
 void processObjectUpdate(const AMCOM_Packet* packet) {
@@ -77,6 +156,7 @@ void processObjectUpdate(const AMCOM_Packet* packet) {
                i, gameState.objects[i].objectType, gameState.objects[i].objectNo,
                gameState.objects[i].hp, gameState.objects[i].x, gameState.objects[i].y);
     }
+    storeNearestSparks();
     removeDeadObjects();
 }
 
@@ -84,6 +164,7 @@ float calculateMovement() {
     if (!gameState.gameActive || gameState.objectCount == 0) {
         return 0.0f; // Stay in place
     }
+    storeNearestSparks();
     
     // Simple random movement for testing
     static bool seedInitialized = false;
@@ -116,18 +197,18 @@ float calculateMovement() {
     }
     
     if (!foundMyself) {
-        printf("Could not find my player! Using random movement.\n");
-        // Generate random angle between 0 and 2*PI radians
-        float randomAngle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
-        printf("Random movement angle: %.2f rad (%.1f degrees)\n", randomAngle, randomAngle * 180.0f / M_PI);
-        return randomAngle;
+        printf("Could not find my player!\n");
+        // // Generate random angle between 0 and 2*PI radians
+        // float randomAngle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
+        // printf("Random movement angle: %.2f rad (%.1f degrees)\n", randomAngle, randomAngle * 180.0f / M_PI);
+        // return randomAngle;
     }
     
     // Find nearest transistor (objectType == 1)
     float bestAngle = 0.0f;
     float minDistance = FLT_MAX;
     bool foundTransistor = false;
-     for (uint8_t i = 0; i < gameState.objectCount; i++) {
+    for (uint8_t i = 0; i < gameState.objectCount; i++) {
         if (gameState.objects[i].objectType == 1) { // Transistor
             float dx = gameState.objects[i].x - myX;
             float dy = gameState.objects[i].y - myY;
@@ -138,7 +219,7 @@ float calculateMovement() {
             
             if (distance < minDistance) {
                 minDistance = distance;
-                bestAngle = atan2f(dy, dx);
+                bestAngle = avoidSparkTrajectory(gameState.objects[i].x, gameState.objects[i].y, myX, myY);
                 foundTransistor = true;
             }
         }
@@ -148,11 +229,11 @@ float calculateMovement() {
         printf("Moving towards nearest transistor: angle %.2f rad (%.1f degrees), distance: %.1f\n", bestAngle, bestAngle * 180.0f / M_PI, minDistance);
         return bestAngle;
     } else {
-        printf("No transistors found! Using random movement.\n");
+        printf("No transistors found!\n");
         // Generate random angle if no transistors available
-        float randomAngle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
-        printf("Random movement angle: %.2f rad (%.1f degrees)\n", randomAngle, randomAngle * 180.0f / M_PI);
-        return randomAngle;
+        // float randomAngle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
+        // printf("Random movement angle: %.2f rad (%.1f degrees)\n", randomAngle, randomAngle * 180.0f / M_PI);
+        // return randomAngle;
     }
 }
 
